@@ -1,0 +1,6 @@
+# Required for the Amadeus API source
+requests>=2.31
+
+# Optional: only needed for the Google Flights scraper.
+# After installing, run:  python -m playwright install chromium
+playwright>=1.45
