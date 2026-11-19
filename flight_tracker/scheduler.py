@@ -7,7 +7,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-from .models import Offer, utc_now_iso
+from .combos import build_one_way_combos
+from .models import COMBO_PROVIDER, Offer, utc_now_iso
 from .providers import create_provider
 from .storage import Store
 
@@ -105,8 +106,12 @@ class TrackerService:
         settings = self.store.effective_settings()
 
         queries = spec.queries()
-        total = len(queries) * len(spec.providers)
+        # One-way legs are searched only to price combinations; they are not stored as offers.
+        leg_queries = spec.one_way_queries()
+        work = [(q, False) for q in queries] + [(q, True) for q in leg_queries]
+        total = len(work) * len(spec.providers)
         offers: list[Offer] = []
+        leg_offers: list[Offer] = []
         errors: list[str] = []
         done = 0
         self.events.put({"type": "run_started", "track_id": track_id, "name": spec.name,
@@ -117,10 +122,10 @@ class TrackerService:
                 missing = provider.missing_config()
                 if missing:
                     errors.append(f"{key}: missing settings ({', '.join(missing)})")
-                    done += len(queries)
+                    done += len(work)
                     self._report(track_id, spec.name, done, total, len(offers))
                     continue
-                for query in queries:
+                for query, is_leg in work:
                     if self._stop.is_set():
                         break
                     kept: list[Offer] = []
@@ -128,9 +133,12 @@ class TrackerService:
                         found = provider.search(query)
                         kept = [o for o in found if spec.allows(o)]
                     except Exception as exc:
-                        errors.append(f"{key} {query.origin}->{query.destination} "
+                        label = "one-way leg " if is_leg else ""
+                        errors.append(f"{key} {label}{query.origin}->{query.destination} "
                                       f"{query.depart_date}: {exc}")
-                    if kept:
+                    if is_leg:
+                        leg_offers.extend(kept)
+                    elif kept:
                         self.store.save_offers(track_id, run_id, kept)
                         offers.extend(kept)
                     done += 1
@@ -141,17 +149,29 @@ class TrackerService:
             finally:
                 provider.close()
 
+        combos = build_one_way_combos(queries, offers, leg_offers) if leg_queries else []
+        if combos:
+            self.store.save_offers(track_id, run_id, combos)
+            offers.extend(combos)
+
         status = "ok" if not errors else ("error" if not offers else "partial")
         self.store.finish_run(run_id, status, done, len(offers), errors)
 
+        # Round-trip prices drive the "new low" check; combos are compared separately below.
+        round_trip_prices = [o.price for o in offers if o.provider != COMBO_PROVIDER]
+        rt_min = min(round_trip_prices, default=None)
         min_price = min((o.price for o in offers), default=None)
         alerts: list[str] = []
         if min_price is not None and spec.budget is not None and min_price <= spec.budget:
             alerts.append(f"Under budget: {spec.currency} {min_price:,.2f} "
                           f"(budget {spec.budget:,.2f})")
-        if min_price is not None and previous_low is not None and min_price < previous_low:
-            alerts.append(f"New low for '{spec.name}': {spec.currency} {min_price:,.2f} "
+        if rt_min is not None and previous_low is not None and rt_min < previous_low:
+            alerts.append(f"New low for '{spec.name}': {spec.currency} {rt_min:,.2f} "
                           f"(was {previous_low:,.2f})")
+        savings = [c.raw["savings"] for c in combos if c.raw.get("savings") is not None]
+        if savings and max(savings) > 0:
+            alerts.append(f"Two one-way tickets beat the round trip by {spec.currency} "
+                          f"{max(savings):,.2f} for '{spec.name}'")
 
         self.events.put({
             "type": "run_done", "track_id": track_id, "name": spec.name,

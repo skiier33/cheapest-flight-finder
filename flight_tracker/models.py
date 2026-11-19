@@ -10,6 +10,8 @@ from typing import Any
 
 CABINS = ("ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST")
 DATE_FIELDS = ("depart_date", "return_date", "depart_from", "depart_to")
+# Provider name for offers built from two one-way tickets (see flight_tracker/combos.py).
+COMBO_PROVIDER = "one_way_combo"
 
 
 def utc_now_iso() -> str:
@@ -105,6 +107,7 @@ class SearchSpec:
     providers: list[str] = field(default_factory=lambda: ["demo"])
     interval_minutes: int = 360
     max_date_combinations: int = 30           # cap per route, keeps API/scrape volume sane
+    one_way_combos: bool = False              # also price the trip as two one-way tickets
 
     def validate(self) -> None:
         errors: list[str] = []
@@ -177,6 +180,30 @@ class SearchSpec:
                   self.cabin, self.currency, self.max_stops)
             for origin, dest in product(self.origins, self.destinations)
             for dep, ret in pairs
+        ]
+
+    def one_way_queries(self) -> list[Query]:
+        """One-way legs needed to price each round trip as two separate tickets.
+
+        For every route and date pair the outbound (origin -> destination on the depart date)
+        and the return (destination -> origin on the return date) are searched. Legs shared by
+        several date pairs are searched once. Empty unless `one_way_combos` is set and the
+        tracker describes round trips.
+        """
+        if not self.one_way_combos:
+            return []
+        pairs = self.date_pairs()
+        if not pairs or pairs[0][1] is None:
+            return []  # one-way trip: there is nothing to split
+        legs: dict[tuple[str, str, date], None] = {}
+        for origin, dest in product(self.origins, self.destinations):
+            for dep, ret in pairs:
+                legs[(origin, dest, dep)] = None
+                legs[(dest, origin, ret)] = None
+        return [
+            Query(origin, dest, day, None, self.adults, self.children,
+                  self.cabin, self.currency, self.max_stops)
+            for origin, dest, day in legs
         ]
 
     def allows(self, offer: Offer) -> bool:

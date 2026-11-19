@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .models import Offer, SearchSpec, utc_now_iso
+from .models import COMBO_PROVIDER, Offer, SearchSpec, utc_now_iso
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -212,17 +212,19 @@ class Store:
         return out
 
     def min_price(self, track_id: int, before_run_id: int | None = None) -> float | None:
-        if before_run_id is None:
-            rows = self._fetch("SELECT MIN(price) AS p FROM offers WHERE track_id = ?", (track_id,))
-        else:
-            rows = self._fetch("SELECT MIN(price) AS p FROM offers WHERE track_id = ? AND run_id < ?",
-                               (track_id, before_run_id))
+        """Lowest round-trip (or one-way) price. Two-ticket combinations are excluded."""
+        sql = "SELECT MIN(price) AS p FROM offers WHERE track_id = ? AND provider != ?"
+        params: list = [track_id, COMBO_PROVIDER]
+        if before_run_id is not None:
+            sql += " AND run_id < ?"
+            params.append(before_run_id)
+        rows = self._fetch(sql, params)
         return rows[0]["p"] if rows and rows[0]["p"] is not None else None
 
     def price_history(self, track_id: int) -> list[tuple[str, float]]:
-        """(run start time, lowest price found in that run) for each run with results."""
+        """(run start time, lowest round-trip price found in that run) for each run with results."""
         rows = self._fetch(
             "SELECT r.started_at AS t, MIN(o.price) AS p FROM runs r "
-            "JOIN offers o ON o.run_id = r.id WHERE r.track_id = ? "
-            "GROUP BY r.id ORDER BY r.started_at", (track_id,))
+            "JOIN offers o ON o.run_id = r.id WHERE r.track_id = ? AND o.provider != ? "
+            "GROUP BY r.id ORDER BY r.started_at", (track_id, COMBO_PROVIDER))
         return [(r["t"], r["p"]) for r in rows]

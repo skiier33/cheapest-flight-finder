@@ -33,6 +33,7 @@ python -m unittest discover -s tests -v
 | Check every | Minutes between automatic runs (minimum 5). |
 | Max dates per route | Caps how many date combinations a flexible range expands to, which limits API calls and scraping volume. When the cap is hit, dates are sampled evenly across the range. |
 | Price sources | Demo, Amadeus API, Google Flights scraper. Select one or more. |
+| Also price as two one-way tickets | Round trips only. Also searches each leg one way and compares the two tickets with the round-trip fare. See below. |
 
 Trackers run automatically in the background while the app is open. A tracker runs immediately when first saved, then on its interval. Runs survive app restarts, and the schedule resumes from the last run time.
 
@@ -56,6 +57,23 @@ While a tracker runs, the status bar shows a progress bar and the Trackers tab s
 ### Other sites
 
 Most airline and aggregator sites (Kayak, Skyscanner, Expedia, and airline sites) either block scraping or forbid it in their terms. To add a source, subclass `flight_tracker.providers.base.Provider`, implement `search(query) -> list[Offer]`, and register it in `flight_tracker/providers/__init__.py`.
+
+## Two one-way tickets vs. a round trip
+
+Airlines and sources sometimes price two one-way tickets below the round-trip fare, and the cheapest legs may come from different carriers or sources. With **Also price as two one-way tickets** ticked, a round-trip tracker also searches:
+
+- the outbound leg, origin → destination on the depart date
+- the return leg, destination → origin on the return date
+
+For each route and date pair, the cheapest outbound and the cheapest return are combined into one offer. Its *Source* is `one_way_combo`, its *Vendor* is "Two one-way tickets", and the *vs round trip* column shows `saves X` or `+X more` against the cheapest round-trip fare found in the same run. Price alerts include a notice when two one-way tickets beat the round trip. The Results table keeps the best combination and the best round trip per trip, so both are visible. The detail pane gives a booking link for each ticket.
+
+Things to know:
+
+- It adds searches. Each distinct leg costs one search per source, so a flexible range with many dates can be expensive on the Amadeus quota or on Google Flights. Use **Max dates per route** to limit this.
+- Individual one-way legs are used only to build combinations and are not stored as offers.
+- A combination mixes sources freely. The two tickets are separate purchases, so check each one before buying.
+- Combinations are saved when the run finishes, not as each search completes.
+- Trackers set up before this option existed behave as before.
 
 ## What gets stored
 
@@ -93,8 +111,10 @@ flight_tracker/
   storage.py                SQLite schema and queries
   models.py                 SearchSpec (dates, filters), Query, Offer
   airports.py               IATA / ICAO / city resolution
+  combos.py                 two one-way tickets vs. the round-trip fare
   providers/                amadeus.py, google_flights.py, demo.py, base.py
 tests/test_core.py          unit tests (no network needed)
+tests/test_combos.py        one-way combination tests
 ```
 
 ## Notes

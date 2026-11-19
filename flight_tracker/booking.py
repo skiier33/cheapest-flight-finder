@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import quote_plus
 
+from .models import COMBO_PROVIDER
+
 GOOGLE_FLIGHTS = "https://www.google.com/travel/flights"
 
 
@@ -19,18 +21,46 @@ def google_flights_url(origin: str, destination: str, depart_date: str,
     return f"{GOOGLE_FLIGHTS}?q={quote_plus(text)}&hl=en&curr={currency or 'USD'}"
 
 
+def is_combo(offer: dict[str, Any]) -> bool:
+    return offer.get("provider") == COMBO_PROVIDER
+
+
+def buy_links(offer: dict[str, Any]) -> list[tuple[str, str, bool]]:
+    """(label, url, exact) for each ticket to buy. A combo has two (outbound and return)."""
+    raw = offer.get("raw") if isinstance(offer.get("raw"), dict) else {}
+    if is_combo(offer):
+        out = raw.get("outbound") or {}
+        back = raw.get("return") or {}
+        return [
+            ("Outbound ticket", out.get("booking_url") or google_flights_url(
+                offer["origin"], offer["destination"], offer["depart_date"], None,
+                offer.get("currency")), bool(out.get("booking_url"))),
+            ("Return ticket", back.get("booking_url") or google_flights_url(
+                offer["destination"], offer["origin"], offer["return_date"], None,
+                offer.get("currency")), bool(back.get("booking_url"))),
+        ]
+    if raw.get("booking_url"):
+        return [("", str(raw["booking_url"]), True)]
+    return [("", google_flights_url(offer["origin"], offer["destination"], offer["depart_date"],
+                                    offer.get("return_date"), offer.get("currency")), False)]
+
+
 def buy_url(offer: dict[str, Any]) -> str:
-    """The provider's own booking link when it has one, otherwise a Google Flights search."""
-    raw = offer.get("raw")
-    if isinstance(raw, dict) and raw.get("booking_url"):
-        return str(raw["booking_url"])
-    return google_flights_url(offer["origin"], offer["destination"], offer["depart_date"],
-                              offer.get("return_date"), offer.get("currency"))
+    """The provider's own booking link when it has one, otherwise a Google Flights search.
+    For a two-ticket combo this is the outbound ticket; see buy_links for both."""
+    return buy_links(offer)[0][1]
 
 
 def buy_url_is_exact(offer: dict[str, Any]) -> bool:
-    raw = offer.get("raw")
-    return isinstance(raw, dict) and bool(raw.get("booking_url"))
+    return all(exact for _label, _url, exact in buy_links(offer))
+
+
+def combo_savings(offer: dict[str, Any]) -> float | None:
+    """How much two one-way tickets save against the round-trip fare (negative = costlier)."""
+    if not is_combo(offer):
+        return None
+    raw = offer.get("raw") if isinstance(offer.get("raw"), dict) else {}
+    return raw.get("savings")
 
 
 def split_clock(value: str | None) -> tuple[str, str]:
@@ -91,22 +121,29 @@ def itinerary_lines(offer: dict[str, Any]) -> list[str]:
 
 
 def csv_extras(offer: dict[str, Any]) -> dict[str, str]:
-    """Extra columns for the CSV export: leg times and the buy link."""
+    """Extra columns for the CSV export: leg times, buy links and the one-way comparison."""
+    links = buy_links(offer)
+    savings = combo_savings(offer)
     return {
         "outbound_depart": leg_clock(offer, 0),
         "return_depart": leg_clock(offer, 1),
-        "buy_url": buy_url(offer),
+        "buy_url": links[0][1],
         "buy_url_exact": "yes" if buy_url_is_exact(offer) else "no",
+        "return_buy_url": links[1][1] if is_combo(offer) else "",
+        "saving_vs_round_trip": "" if savings is None else f"{savings:.2f}",
     }
 
 
 def trip_key(offer: dict[str, Any]) -> tuple:
     return (offer["origin"], offer["destination"], offer["depart_date"], offer.get("return_date") or "",
-            offer.get("currency") or "")
+            offer.get("currency") or "", is_combo(offer))
 
 
 def best_per_trip(offers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Cheapest offer seen for each route and date pair, ordered by price."""
+    """Cheapest offer seen for each route and date pair, ordered by price.
+
+    Two-ticket combinations are kept apart from round-trip fares so each can be compared
+    with the other."""
     best: dict[tuple, dict[str, Any]] = {}
     for offer in offers:
         key = trip_key(offer)

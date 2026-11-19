@@ -14,8 +14,8 @@ from .airports import describe, resolve_airports
 from .models import CABINS, SearchSpec
 from .providers import REGISTRY, create_provider
 from .scheduler import TrackerService
-from .booking import (best_per_trip, buy_url, buy_url_is_exact, csv_extras, itinerary_lines,
-                      leg_clock)
+from .booking import (best_per_trip, buy_links, buy_url, buy_url_is_exact, combo_savings,
+                      csv_extras, is_combo, itinerary_lines, leg_clock)
 from .storage import Store
 from .visualize import write_page
 
@@ -54,8 +54,20 @@ RESULT_COLS = [
     ("return", "Return", 95), ("ret_time", "Back", 60), ("airlines", "Airlines", 110),
     ("flights", "Flight #s", 150), ("stops", "Stops", 70), ("duration", "Duration", 80),
     ("vendor", "Vendor", 180), ("seen", "Last seen", 130), ("provider", "Source", 110),
-    ("link", "Buy link", 80),
+    ("vs_rt", "vs round trip", 120), ("link", "Buy link", 80),
 ]
+
+
+def savings_text(o: dict) -> str:
+    """For two-ticket combinations: how they compare with the round-trip fare in the same run."""
+    savings = combo_savings(o)
+    if savings is None:
+        return ""
+    if savings > 0:
+        return f"saves {savings:,.2f}"
+    if savings < 0:
+        return f"+{-savings:,.2f} more"
+    return "same price"
 
 
 def result_values(o: dict) -> tuple:
@@ -67,7 +79,7 @@ def result_values(o: dict) -> tuple:
         o["return_date"] or "one-way", leg_clock(o, 1),
         o["airlines"] or "n/a", o["flight_numbers"] or "n/a", stops,
         fmt_minutes(o["duration_minutes"]), o["vendor"], fmt_local(o["scraped_at"]), o["provider"],
-        "fare" if buy_url_is_exact(o) else "search",
+        savings_text(o), "fare" if buy_url_is_exact(o) else "search",
     )
 
 
@@ -88,6 +100,9 @@ def result_sort_key(o: dict, col: str):
         return o["outbound_stops"] if o["outbound_stops"] is not None else 99
     if col == "seen":
         return o["scraped_at"]
+    if col == "vs_rt":
+        savings = combo_savings(o)
+        return float("-inf") if savings is None else savings
     if col == "link":
         return "fare" if buy_url_is_exact(o) else "search"
     text_fields = {"currency": "currency", "airlines": "airlines", "flights": "flight_numbers",
@@ -238,6 +253,7 @@ class FlightTrackerApp:
         self.v_currency = tk.StringVar(value="USD")
         self.v_interval = tk.StringVar(value="360")
         self.v_max_combos = tk.StringVar(value="30")
+        self.v_one_way = tk.BooleanVar(value=False)
         self.v_providers = {key: tk.BooleanVar(value=(key == "demo")) for key in REGISTRY}
 
         # Left and right panels share a draggable sash.
@@ -300,9 +316,11 @@ class FlightTrackerApp:
                   "minimum 5")
         self._row(right, 9, "Max dates per route", ttk.Entry(right, textvariable=self.v_max_combos, width=24),
                   "caps API / scrape volume")
-        ttk.Label(right, text="Price sources").grid(row=10, column=0, sticky="nw", padx=4, pady=3)
+        ttk.Checkbutton(right, text="Also price as two one-way tickets (round trips only)",
+                        variable=self.v_one_way).grid(row=10, column=0, columnspan=3, sticky="w", padx=4, pady=3)
+        ttk.Label(right, text="Price sources").grid(row=11, column=0, sticky="nw", padx=4, pady=3)
         sources = ttk.Frame(right)
-        sources.grid(row=10, column=1, columnspan=2, sticky="w")
+        sources.grid(row=11, column=1, columnspan=2, sticky="w")
         for key, cls in REGISTRY.items():
             ttk.Checkbutton(sources, text=cls.label, variable=self.v_providers[key]).pack(anchor="w")
         right.columnconfigure(1, weight=1)
@@ -402,6 +420,7 @@ class FlightTrackerApp:
             exclude_airlines=codes(self.v_exclude.get()),
             budget=budget, currency=self.v_currency.get().strip().upper() or "USD",
             providers=providers, interval_minutes=interval, max_date_combinations=max_combos,
+            one_way_combos=self.v_one_way.get(),
         )
         spec.validate()
         return spec
@@ -455,6 +474,7 @@ class FlightTrackerApp:
         self.v_currency.set("USD")
         self.v_interval.set("360")
         self.v_max_combos.set("30")
+        self.v_one_way.set(False)
         for key, var in self.v_providers.items():
             var.set(key == "demo")
         self._update_mode_state()
@@ -488,6 +508,7 @@ class FlightTrackerApp:
         self.v_currency.set(s.currency)
         self.v_interval.set(str(s.interval_minutes))
         self.v_max_combos.set(str(s.max_date_combinations))
+        self.v_one_way.set(s.one_way_combos)
         for key, var in self.v_providers.items():
             var.set(key in s.providers)
         self._update_mode_state()
@@ -813,22 +834,21 @@ class FlightTrackerApp:
         route = f"{offer['origin']} → {offer['destination']}  depart {offer['depart_date']}"
         route += f", return {offer['return_date']}" if offer["return_date"] else " (one-way)"
         itinerary = itinerary_lines(offer) or ["(no leg details captured for this source)"]
-        lines = [
-            route,
-            f"{offer['price']:,.2f} {offer['currency']}  ·  {offer['vendor']}  ·  {offer['cabin']}",
-            f"Last seen {fmt_local(offer['scraped_at'])}"
-            + (f"  ·  {offer['seats_left']} seats left" if offer["seats_left"] is not None else ""),
-            "",
-            "Itinerary:",
-            *("  " + line for line in itinerary),
-            "",
-        ]
-        if buy_url_is_exact(offer):
-            lines.append("Booking link (provider's fare):")
-        else:
-            lines.append("Booking link (Google Flights search for these dates; the fare may differ "
-                         "or not be offered there. Confirm the price before buying):")
-        lines.append(buy_url(offer))
+        header = [route, f"{offer['price']:,.2f} {offer['currency']}  ·  {offer['vendor']}  ·  {offer['cabin']}",
+                  f"Last seen {fmt_local(offer['scraped_at'])}"
+                  + (f"  ·  {offer['seats_left']} seats left" if offer["seats_left"] is not None else "")]
+        if is_combo(offer):
+            header.append("Two one-way tickets instead of the round trip. Round-trip comparison: "
+                          + (savings_text(offer) or "no round-trip fare found in this run to compare with"))
+        lines = [*header, "", "Itinerary:", *("  " + line for line in itinerary), ""]
+        # Each ticket gets its own link. A combo has two; a single fare has one.
+        for label, url, exact in buy_links(offer):
+            prefix = f"{label} " if label else ""
+            if exact:
+                lines += [f"{prefix}Booking link (provider's fare):", url]
+            else:
+                lines += [f"{prefix}Booking link (Google Flights search for these dates; the fare may "
+                          "differ or not be offered there. Confirm the price before buying):", url]
         self.detail.insert("1.0", "\n".join(lines))
 
     def _draw_history(self, track_id: int) -> None:
@@ -882,7 +902,8 @@ class FlightTrackerApp:
         fields = ["scraped_at", "provider", "vendor", "origin", "destination", "depart_date",
                   "return_date", "price", "currency", "airlines", "flight_numbers", "outbound_stops",
                   "return_stops", "duration_minutes", "cabin", "seats_left",
-                  "outbound_depart", "return_depart", "buy_url", "buy_url_exact"]
+                  "outbound_depart", "return_depart", "buy_url", "buy_url_exact",
+                  "return_buy_url", "saving_vs_round_trip"]
         with open(path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
